@@ -1,0 +1,155 @@
+Version: "1.0"
+
+mlflow:
+  tracking_uri: "http://3.211.237.84:5000/"
+  default_experiment: "Assessment-assist"
+  artifact_path_prefix: ""
+
+aws:
+  region: "us-east-1"
+
+upload:
+  filename_pattern: "^lbrn-(?P<course_id>[^-]+)-(?P<lesson_id>[^-]+)-(?P<assignment_id>[^.]+)\\.(pdf|docx|txt)$"
+
+storage:
+  upload_bucket: "lbrn-student-uploads-assessment-2025"
+
+logs:
+  LOG_DIR: "logs"
+  LOG_FILE_PREFIX: "assignment_evaluator"
+  GLOBAL_COMPACT_THRESHOLD_BYTES: 1 * 1024 * 1024 * 1024 # 1 GB
+  ZIP_RETENTION_DAYS: 2
+  MAINTENANCE_INTERVAL_SECONDS: 60 * 60
+
+consumer:
+  start_in_app: true
+  worker_count: 1
+  mode: "enqueue"
+  prefetch_count: 1
+
+job_manager:
+  max_workers: 4                  # number of parallel extractor processes
+  task_timeout_seconds: 300       # timeout per individual student extraction
+  task_retries: 1                 # number of retry attempts per task
+  job_lock_ttl_seconds: 300       # redis lock TTL to prevent duplicate runs
+  retry_backoff_seconds: 5        # sleep between retries
+  enable_locking: true            # use redis-based locking
+  log_progress_every: 10          # log after every 10 tasks (to reduce spam)
+
+mongo:
+  host: "3.211.237.84"
+  port: "27017"
+  db_name: "assignments"
+  username: "lbrn_admin_user"
+  password: "lbrn_dev_2025_02"
+  raw_lessons_db: "tutorials"
+  raw_lessons_collection: "raw_lessons"
+  jobs_collection: "jobs"
+  rubrics_collection: "rubrics"
+  prompt_collection: "prompt_builder"#
+
+redis:
+  host: "3.211.237.84"
+  port: 5003
+  db: 0
+  username: ""                  # optional for Redis ACL
+  password: "redis_pass"
+  expire_seconds: 43200          # cache expiration time in seconds
+
+rabbitmq:
+  host: "3.211.237.84"
+  port: 5005
+  username: "lbrn_dev"
+  password: "lbrn_dev_2025_01"
+  input_queue: "evaluation_input"          # your queue
+  exchange: "evaluation_exchange"    # explicit exchange used by this service
+  dlx_exchange: "assignment_dlx"              # optional
+  dlq_queue: "assignment_dlq"
+
+embedding:
+  model: "text-embedding-3-small"
+  chunk_size: 500
+  overlap: 50
+
+
+ollama:
+  #api_url: "http://54.162.142.82:11434/api/generate"
+  api_url: "http://localhost:11434/api/generate"
+  model_name: "llama3:8b"
+  #model_name: "llama3.2:latest"
+  max_tokens: 50000
+
+retrieval:
+  top_k: 12                   # how many chunks to fetch by similarity
+  token_budget: 20000         # context token budget for building prompt (increased)
+  char_token_ratio: 0.25     # heuristic conversion from chars -> tokens
+  min_similarity: 0.55       # threshold below which course context is "not relevant"
+  auto_answer_general: true # if true: automatically answer from general knowledge but clearly label it
+
+
+llm:
+  provider: "bedrock"              # options: "ollama" | "bedrock" | "hybrid"
+  # model / tagging
+  model: "llama3:8b"
+  # Prompt / truncation tunables used by worker.py
+  system_prompt_max_chars: 80000
+  chunk_system_prompt_max_chars: 50000
+  top_full_in_screening: 10
+  chunk_summary_chars: 9000
+  chunk_send_max_chars: 9000
+  top_full_text_max_chars: 9000
+  max_chunk_system_prompt_chars: 80000
+  # Generic/truncation defaults used across helpers (new keys)
+  default_max_chars: 9000
+  assignment_max_chars: 20000
+  submission_max_chars: 9000
+  max_comment_chars: 5000
+  # Hybrid-specific tuning (only used when provider == "hybrid")
+  hybrid:
+    hedge_delay_ms: 15000      # start Bedrock if Ollama not finished by this delay (ms)
+    connect_timeout_s: 2.0     # TCP connect timeout for Ollama
+    read_timeout_s: 300        # per-request read timeout for Ollama
+    # Optional simple circuit breaker (not strictly required by code yet)
+    # fail_threshold: 5
+    # cooldown_s: 300
+
+
+# AWS Bedrock settings (used when llm.provider == "bedrock")
+bedrock:
+  region: "us-east-1"
+  model_id: "anthropic.claude-3-5-haiku-20241022-v1:0"  # make configurable
+  max_tokens: 1024
+  temperature: 0.2
+  # inference_profile_arn: "arn:aws:bedrock:us-east-1:123456789012:inference-profile/anthropic.claude-3-5-haiku-20241022-v1-pt-xyz"
+  inference_profile_arn: "arn:aws:bedrock:us-east-1:445567115207:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0"
+
+
+auth:
+  algorithm: "HS256"
+  secret: "8a7f3e4c3e2d1e8f4b0a62cda3ff4d6b77a1e5c4c0bfb77d20f87e08b91a2f44"   # <- do NOT commit to repo; use env/secret manager
+  issuer: null             # optional, only if issuer sets "iss"
+  audience: null            # optional, only if token uses "aud"
+  sessionize: true
+  session_ttl_seconds: 3600
+
+airflow:
+  enabled: true                     # master switch to enable/disable Airflow HTTP triggers
+  base_url: "http://3.211.237.84:5008"   # Airflow webserver URL (container host when using compose)
+  auth:
+    type: "basic"                   # options: basic | token | none
+    username: "airflow"               # recommended: override via env var AIRFLOW_USER
+    password: "airflow"               # recommended: override via env var AIRFLOW_PASS
+    token: ""                       # if using token auth instead
+  dag:
+    id: "evaluate_assignment"       # DAG id to trigger
+    conf_template: {}               # optional default conf merged with runtime conf
+  trigger:
+    on_start_event: false           # if true -> teacher_start will hit Airflow after publishing start_event
+    on_prepared_event: true         # if true -> extraction worker will hit Airflow after persisting text
+    # You can enable both; DAG should handle dedup if needed
+  timeout_seconds: 8                # HTTP timeout
+
+debug:
+  debug_prompts: true            # enable verbose debug prompt logging
+  persist_prompts_in_db: true    # persist prompt previews and payloads into MongoDB for inspection
+  prompt_truncate_chars: 20000   # how many chars to keep in previews
