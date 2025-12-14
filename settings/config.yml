@@ -92,18 +92,18 @@ llm:
   # model / tagging
   model: "llama3:8b"
   # Prompt / truncation tunables used by worker.py
-  system_prompt_max_chars: 80000
-  chunk_system_prompt_max_chars: 50000
+  system_prompt_max_chars: 800000
+  chunk_system_prompt_max_chars: 500000
   top_full_in_screening: 10
-  chunk_summary_chars: 9000
-  chunk_send_max_chars: 9000
-  top_full_text_max_chars: 9000
-  max_chunk_system_prompt_chars: 80000
+  chunk_summary_chars: 900000
+  chunk_send_max_chars: 900000
+  top_full_text_max_chars: 90000
+  max_chunk_system_prompt_chars: 800000
   # Generic/truncation defaults used across helpers (new keys)
-  default_max_chars: 9000
-  assignment_max_chars: 20000
-  submission_max_chars: 9000
-  max_comment_chars: 5000
+  default_max_chars: 900000
+  assignment_max_chars: 200000
+  submission_max_chars: 9000000
+  max_comment_chars: 50000
   # Hybrid-specific tuning (only used when provider == "hybrid")
   hybrid:
     hedge_delay_ms: 15000      # start Bedrock if Ollama not finished by this delay (ms)

@@ -2,7 +2,8 @@
 from typing import List, Dict, Optional
 import json
 
-def _format_rubric_for_prompt(rubric: Optional[Dict], max_chars: int = 20000) -> str:
+
+def _format_rubric_for_prompt(rubric: Optional[Dict], max_chars: int = 200000) -> str:
     """
     Robust formatter for rubric content used in system prompts.
 
@@ -59,14 +60,25 @@ def build_system_prompt_from_chunks(compact_chunks: List[Dict],
     header = (
         f"Course: {course_id or 'unknown'}\n"
         f"{rubric_text}\n\n"
+        "Rubric precedence (AUTHORITATIVE): The rubric text above contains the authoritative grading steps. "
+        "If any other part of this prompt (including examples or schema) appears to conflict with the rubric, "
+        "FOLLOW THE RUBRIC. All scoring values (per-criterion and overall) MUST follow the rubric’s own scale.\n\n"
         "Strict Rules (READ CAREFULLY):\n"
-        "1) Use ONLY the transcript/course context provided below as the source of truth. Do NOT use any external knowledge, the internet, training data, or general world knowledge.\n"
-        "2) If an assessment or fact **requires** information NOT present in the provided course context, you MUST NOT hallucinate — instead set 'scores' and 'overall' to null and provide clear feedback explaining what is missing. Also add 'requires_external_knowledge' (or a similarly descriptive string) to the 'violations' array.\n"
-        "3) Do NOT call out or infer content from authors, external references, or any data not explicitly present in the supplied chunks.\n"
+        "1) Use ONLY the transcript/course context provided below as the source of truth. Do NOT use any external "
+        "knowledge, the internet, training data, or general world knowledge.\n"
+        "2) If an assessment or fact **requires** information NOT present in the provided course context, you MUST NOT "
+        "hallucinate — instead set 'scores' and 'overall' to null and provide clear feedback explaining what is missing. "
+        "Also add 'requires_external_knowledge' (or a similarly descriptive string) to the 'violations' array.\n"
+        "3) Do NOT call out or infer content from authors, external references, or any data not explicitly present in the "
+        "supplied chunks.\n"
         "4) Return EXACTLY one JSON object and nothing else. Schema: "
-        "{\"scores\": {\"<criterion_id>\": 0.0-1.0, ...} | null, \"overall\": 0.0-1.0 | null, \"feedback\": \"string\", \"violations\": [\"string\", ...]}.\n"
-        "Example: " + json.dumps({"scores": {"correctness": 0.9}, "overall": 0.9, "feedback": "Good", "violations": []}) + "\n\n"
-        "Important: You may also return an optional top-level key 'priority_chunks' (array of chunk ids ordered by importance) to indicate which chunks informed your judgement. Only use chunk ids present in the provided context.\n\n"
+        "{\"scores\": {\"<criterion_id>\": <number>, ...} | null, "
+        "\"overall\": <number> | null, "
+        "\"feedback\": \"string\", "
+        "\"violations\": [\"string\", ...]}.\n"
+        "Example: {\"scores\": {\"criterion_id\": 5}, \"overall\": 80, \"feedback\": \"Example feedback.\", \"violations\": []}\n\n"
+        "Important: You may also return an optional top-level key 'priority_chunks' (array of chunk ids ordered by "
+        "importance) to indicate which chunks informed your judgement. Only use chunk ids present in the provided context.\n\n"
     )
 
     index_lines = []
@@ -101,6 +113,7 @@ def build_system_prompt_from_chunks(compact_chunks: List[Dict],
     return system_prompt
 
 
+
 def build_chunk_system_prompt(chunk_id: int,
                               chunk_text: str,
                               rubric: Optional[Dict] = None,
@@ -111,10 +124,13 @@ def build_chunk_system_prompt(chunk_id: int,
     header = (
         f"Course chunk: CHUNK:{course_id or 'COURSE'}:{chunk_id}\n"
         f"{rubric_text}\n\n"
+        # Make rubric authoritative at chunk-level as well.
+        "IMPORTANT: The rubric above is authoritative for grading this chunk. If any instruction or example elsewhere "
+        "in this prompt conflicts with the rubric, FOLLOW THE RUBRIC when assigning scores.\n\n"
         "Rules:\n"
         "1) Evaluate RELATIVE TO THIS CHUNK ONLY. Do NOT use any external knowledge, internet access, or assumptions beyond the text in this chunk.\n"
         "2) If the student submission requires information not in this chunk to be graded, set 'assessments' and 'confidence' to null/0 and explain clearly in 'comments' what is missing; include 'requires_external_knowledge' in 'comments' or as a short tag.\n"
         "3) Return EXACTLY one JSON object: "
-        "{\"chunk_id\": int, \"assessments\": {\"<criterion_id>\": 0.0-1.0, ...} | null, \"comments\": \"string\", \"confidence\": 0.0-1.0}.\n"
+        "{\"chunk_id\": int, \"assessments\": {\"<criterion_id\": 0.0-1.0, ...} | null, \"comments\": \"string\", \"confidence\": 0.0-1.0}.\n"
     )
     return header + "\n### Chunk Context ###\n" + block + "\n### End ###"

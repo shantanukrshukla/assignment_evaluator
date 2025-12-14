@@ -1,10 +1,12 @@
 # app.py
+import json
+import re
+
 from fastapi import FastAPI, Query, HTTPException
 import threading
 import uuid
-import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from utils.config_loader import config
 from utils.mongo_client import db
 from utils.logging import logger
@@ -130,37 +132,103 @@ def admin_manual_scan():
     return {"processed": n}
 
 
-@app.get("/assignments/{assignment_id}/results")
-def get_assignment(assignment_id: str):
+def _extract_json_from_llm_raw(raw: str) -> dict:
     """
-    Fetch assignment doc and evaluation results.
+    Extracts the first valid JSON object from llm_raw,
+    even if extra text follows.
     """
-    coll = db[config.get("mongo", {}).get("prompt_collection", "prompt_builder")]
-    doc = coll.find_one({"assignment_id": assignment_id})
-    if not doc:
-        raise HTTPException(status_code=404, detail="assignment not found")
 
-    # convert ObjectId to string for transport
-    doc_copy = dict(doc)
-    _id = doc_copy.pop("_id", None)
-    if _id is not None:
-        doc_copy["_id"] = str(_id)
+    try:
+        # Find the first {...} JSON block using a greedy match
+        match = re.search(r'\{.*\}', raw, flags=re.DOTALL)
+        if not match:
+            return {}
 
-    # prune raw model text if present and too large (optional)
-    if doc_copy.get("model_raw_response") and len(str(doc_copy.get("model_raw_response"))) > 20000:
-        doc_copy["model_raw_response_preview"] = str(doc_copy.get("model_raw_response"))[:10000] + " ...[truncated]"
-        doc_copy.pop("model_raw_response", None)
+        json_str = match.group(0)
+        return json.loads(json_str)
+
+    except Exception:
+        return {}
+
+def _result_from_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build result object using model_raw_response.llm_raw,
+    supporting both OLD and NEW LLM response formats.
+    """
+
+    scores = None
+    overall = None
+    feedback = None
+    violations = []
+
+    mrr = doc.get("model_raw_response")
+    if mrr:
+        llm_raw = mrr.get("llm_raw")
+        if llm_raw:
+            parsed = _extract_json_from_llm_raw(llm_raw)
+
+            # 🔁 BACKWARD + FORWARD COMPATIBILITY
+            # New LLM format
+            if "total_score" in parsed:
+                overall = parsed.get("total_score")
+                scores = parsed.get("grade_breakdown")
+                feedback = parsed.get("feedback")
+                violations = parsed.get("priority_chunks") or []
+
+            # Old LLM format (fallback)
+            else:
+                scores = parsed.get("scores")
+                overall = parsed.get("overall")
+                feedback = parsed.get("feedback")
+                violations = parsed.get("violations") or []
 
     return {
+        "assignment_id": doc.get("assignment_id"),
+        "student_id": doc.get("student_id"),
+        "evaluation_status": doc.get("evaluation_status"),
+        "scores": scores,
+        "overall": overall,
+        "feedback": feedback,
+        "violations": violations,
+    }
+
+@app.get("/assignments/{job_id}/{assignment_id}/results")
+def get_assignment_results(
+    job_id: str,
+    assignment_id: str,
+    student_id: Optional[str] = Query(None),
+):
+    coll = db[config.get("mongo", {}).get("prompt_collection", "prompt_builder")]
+
+    base_query = {
+        "evaluation_job_id": job_id,
+        "assignment_id": assignment_id
+    }
+
+    if student_id:
+        # Single-student mode
+        doc = coll.find_one(
+            {**base_query, "student_id": student_id},
+            sort=[("_id", -1)]
+        )
+        if not doc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"assignment {assignment_id} for job {job_id} and student {student_id} not found"
+            )
+        return _result_from_doc(doc)
+
+    # Batch mode
+    cursor = coll.find(base_query)
+    results = [_result_from_doc(d) for d in cursor]
+
+    # NEW: compute completed count
+    completed_count = sum(1 for r in results if r.get("evaluation_status") == "done")
+
+    return {
+        "job_id": job_id,
         "assignment_id": assignment_id,
-        "evaluated": doc_copy.get("evaluated"),
-        "evaluation_status": doc_copy.get("evaluation_status"),
-        "evaluation_result": {
-            "scores": doc_copy.get("scores"),
-            "overall": doc_copy.get("overall"),
-            "feedback": doc_copy.get("feedback"),
-            "violations": doc_copy.get("violations"),
-        },
-        "re_evaluation_requested": doc_copy.get("re_evaluation_requested"),
-        "raw_doc": doc_copy
+        "count": len(results),
+        **({"completed": completed_count}),
+        "results": results,
     }
