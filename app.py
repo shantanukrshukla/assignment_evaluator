@@ -1,12 +1,13 @@
 # app.py
 import json
 import re
-
-from fastapi import FastAPI, Query, HTTPException
 import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
+
+from fastapi import FastAPI, Query, HTTPException
+
 from utils.config_loader import config
 from utils.mongo_client import db
 from utils.logging import logger
@@ -22,7 +23,6 @@ _SCANNER_STOP_EVENT: Optional[threading.Event] = None
 @app.on_event("startup")
 def startup_event():
     logger.info("app.startup: starting Assignment Evaluator app")
-    # Start the DB-scanner background thread if configured
     if config.get("scanner", {}).get("start_in_app", True):
         global _SCANNER_THREAD, _SCANNER_STOP_EVENT
         _SCANNER_STOP_EVENT = threading.Event()
@@ -59,14 +59,10 @@ def health() -> Dict[str, Any]:
 
 @app.post("/assignments/{assignment_id}/re-evaluate")
 def re_evaluate(assignment_id: str):
-    """
-    Mark assignment for re-evaluation. Scanner will pick up document.
-    """
     logger.info("api.re_evaluate: request for assignment_id=%s", assignment_id)
     coll = db[config.get("mongo", {}).get("prompt_collection", "prompt_builder")]
     doc = coll.find_one({"assignment_id": assignment_id})
     if not doc:
-        logger.warning("api.re_evaluate: document not found for assignment_id=%s", assignment_id)
         raise HTTPException(status_code=404, detail="assignment not found")
 
     run_id = str(uuid.uuid4())
@@ -84,21 +80,15 @@ def re_evaluate(assignment_id: str):
             "evaluation_queued_at": datetime.now(timezone.utc)
         }}
     )
-
-    logger.info("api.re_evaluate: queued doc _id=%s run_id=%s", str(doc["_id"]), run_id)
     return {"status": "queued_for_re_evaluation", "job_id": run_id}
 
 
 @app.post("/assignments/{assignment_id}/evaluate")
 def evaluate(assignment_id: str, force: bool = Query(False)):
-    """
-    Mark an assignment for evaluation.
-    """
     logger.info("api.evaluate: request for assignment_id=%s force=%s", assignment_id, force)
     coll = db[config.get("mongo", {}).get("prompt_collection", "prompt_builder")]
     doc = coll.find_one({"assignment_id": assignment_id})
     if not doc:
-        logger.warning("api.evaluate: document not found for assignment_id=%s", assignment_id)
         raise HTTPException(status_code=404, detail="assignment not found")
 
     run_id = str(uuid.uuid4())
@@ -116,70 +106,102 @@ def evaluate(assignment_id: str, force: bool = Query(False)):
             "evaluated": False
         }}
     )
-
-    logger.info("api.evaluate: queued doc _id=%s run_id=%s", str(doc["_id"]), run_id)
     return {"status": "queued_for_evaluation", "job_id": run_id}
 
 
 @app.post("/admin/scan-evaluate")
 def admin_manual_scan():
-    """
-    Trigger a single scan pass synchronously (useful for debugging).
-    """
     logger.info("api.admin_manual_scan: triggered by admin")
     n = scan_and_process_once()
-    logger.info("api.admin_manual_scan: scan processed=%d", n)
     return {"processed": n}
 
 
 def _extract_json_from_llm_raw(raw: str) -> dict:
     """
-    Extracts the first valid JSON object from llm_raw,
-    even if extra text follows.
+    Extract first valid JSON object from llm_raw
     """
-
     try:
-        # Find the first {...} JSON block using a greedy match
-        match = re.search(r'\{.*\}', raw, flags=re.DOTALL)
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if not match:
             return {}
-
-        json_str = match.group(0)
-        return json.loads(json_str)
-
+        return json.loads(match.group(0))
     except Exception:
         return {}
 
+
+def _format_feedback_markdown(feedback_obj: Any) -> Optional[str]:
+    """
+    Normalize and format AI-generated feedback into clean markdown.
+    Handles both pre-formatted markdown strings and dynamic dict structures.
+    """
+
+    # ✅ Case 1: Already markdown string
+    if isinstance(feedback_obj, str):
+        # Normalize 3+ newlines → 2 newlines
+        cleaned = re.sub(r"\n{3,}", "\n\n", feedback_obj)
+        return cleaned.strip()
+
+    # ❌ Not usable
+    if not isinstance(feedback_obj, dict):
+        return None
+
+    parts: List[str] = []
+
+    for section, content in feedback_obj.items():
+        parts.append(f"### {section}")
+
+        if isinstance(content, list):
+            for item in content:
+                parts.append(f"- {item}")
+
+        elif isinstance(content, dict):
+            for k, v in content.items():
+                parts.append(f"- **{k}:** {v}")
+
+        else:
+            parts.append(f"- {content}")
+
+        parts.append("")  # single spacing between sections
+
+    result = "\n".join(parts)
+
+    # Final safety normalization
+    result = re.sub(r"\n{3,}", "\n\n", result)
+
+    return result.strip() if result else None
+
 def _result_from_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build result object using model_raw_response.llm_raw,
-    supporting both OLD and NEW LLM response formats.
+    Build API result from stored document.
+    Handles old + new LLM formats and reformats feedback to markdown.
     """
 
     scores = None
     overall = None
-    feedback = None
-    violations = []
+    feedback_md = None
+    violations: List[Any] = []
 
     mrr = doc.get("model_raw_response")
     if mrr:
         llm_raw = mrr.get("llm_raw")
         if llm_raw:
             parsed = _extract_json_from_llm_raw(llm_raw)
+            logger.info(f"Parsed LLM raw: {parsed}")
 
-            # 🔁 BACKWARD + FORWARD COMPATIBILITY
             # New LLM format
             if "total_score" in parsed:
                 overall = parsed.get("total_score")
                 scores = parsed.get("grade_breakdown")
-                feedback = parsed.get("feedback")
+                passed_status = parsed.get("passed")
+                feedback_md = _format_feedback_markdown(parsed.get("feedback"))
                 violations = parsed.get("priority_chunks") or []
 
-            # Old LLM format (fallback)
+            # Old LLM format
             else:
-                scores = parsed.get("scores")
                 overall = parsed.get("overall")
-                feedback = parsed.get("feedback")
+                scores = parsed.get("scores")
+                passed_status = parsed.get("passed")
+                feedback_md = _format_feedback_markdown(parsed.get("feedback"))
                 violations = parsed.get("violations") or []
 
     return {
@@ -188,9 +210,11 @@ def _result_from_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "evaluation_status": doc.get("evaluation_status"),
         "scores": scores,
         "overall": overall,
-        "feedback": feedback,
+        "feedback": feedback_md,
         "violations": violations,
+        "passed_status": passed_status,
     }
+
 
 @app.get("/assignments/{job_id}/{assignment_id}/results")
 def get_assignment_results(
@@ -206,7 +230,6 @@ def get_assignment_results(
     }
 
     if student_id:
-        # Single-student mode
         doc = coll.find_one(
             {**base_query, "student_id": student_id},
             sort=[("_id", -1)]
@@ -218,17 +241,15 @@ def get_assignment_results(
             )
         return _result_from_doc(doc)
 
-    # Batch mode
     cursor = coll.find(base_query)
     results = [_result_from_doc(d) for d in cursor]
 
-    # NEW: compute completed count
     completed_count = sum(1 for r in results if r.get("evaluation_status") == "done")
 
     return {
         "job_id": job_id,
         "assignment_id": assignment_id,
         "count": len(results),
-        **({"completed": completed_count}),
+        "completed": completed_count,
         "results": results,
     }
