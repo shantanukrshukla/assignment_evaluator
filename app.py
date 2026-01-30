@@ -13,16 +13,21 @@ from utils.mongo_client import db
 from utils.logging import logger
 from module.scanner_db_runner import scanner_loop, scan_and_process_once
 
-app = FastAPI(title="Assignment Evaluator (modular)")
+app = FastAPI(title="Assignment Evaluator")
 
-# Globals for scanner thread
+# ---------------------------------------------------------------------
+# Scanner thread globals
+# ---------------------------------------------------------------------
 _SCANNER_THREAD: Optional[threading.Thread] = None
 _SCANNER_STOP_EVENT: Optional[threading.Event] = None
 
 
+# ---------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------
 @app.on_event("startup")
 def startup_event():
-    logger.info("app.startup: starting Assignment Evaluator app")
+    logger.info("Starting Assignment Evaluator")
     if config.get("scanner", {}).get("start_in_app", True):
         global _SCANNER_THREAD, _SCANNER_STOP_EVENT
         _SCANNER_STOP_EVENT = threading.Event()
@@ -32,177 +37,154 @@ def startup_event():
             daemon=True
         )
         _SCANNER_THREAD.start()
-        logger.info("app.startup: scanner loop started in background thread")
 
 
 @app.on_event("shutdown")
 def shutdown_event():
-    logger.info("app.shutdown: shutting down Assignment Evaluator app")
     global _SCANNER_THREAD, _SCANNER_STOP_EVENT
     if _SCANNER_STOP_EVENT:
         _SCANNER_STOP_EVENT.set()
-        logger.info("app.shutdown: signalled scanner to stop")
     if _SCANNER_THREAD:
         _SCANNER_THREAD.join(timeout=5)
-        logger.info("app.shutdown: scanner thread join attempted")
 
 
+# ---------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------
 @app.get("/health")
-def health() -> Dict[str, Any]:
+def health():
     try:
-        _ = db.list_collection_names()
+        db.list_collection_names()
         return {"status": "ok", "mongo": True}
     except Exception:
-        logger.exception("health: mongo check failed")
         return {"status": "degraded", "mongo": False}
 
 
+# ---------------------------------------------------------------------
+# Evaluation APIs
+# ---------------------------------------------------------------------
 @app.post("/assignments/{assignment_id}/re-evaluate")
 def re_evaluate(assignment_id: str):
-    logger.info("api.re_evaluate: request for assignment_id=%s", assignment_id)
     coll = db[config.get("mongo", {}).get("prompt_collection", "prompt_builder")]
     doc = coll.find_one({"assignment_id": assignment_id})
     if not doc:
-        raise HTTPException(status_code=404, detail="assignment not found")
+        raise HTTPException(404, "assignment not found")
 
     run_id = str(uuid.uuid4())
     coll.update_one(
         {"_id": doc["_id"]},
         {"$set": {
-            "re_evaluation_requested": {
-                "request_id": run_id,
-                "requested_by": "api",
-                "requested_at": datetime.now(timezone.utc),
-                "force": True
-            },
-            "evaluated": False,
             "evaluation_status": "queued",
+            "evaluated": False,
             "evaluation_queued_at": datetime.now(timezone.utc)
         }}
     )
-    return {"status": "queued_for_re_evaluation", "job_id": run_id}
+    return {"status": "queued", "job_id": run_id}
 
 
 @app.post("/assignments/{assignment_id}/evaluate")
-def evaluate(assignment_id: str, force: bool = Query(False)):
-    logger.info("api.evaluate: request for assignment_id=%s force=%s", assignment_id, force)
-    coll = db[config.get("mongo", {}).get("prompt_collection", "prompt_builder")]
-    doc = coll.find_one({"assignment_id": assignment_id})
-    if not doc:
-        raise HTTPException(status_code=404, detail="assignment not found")
-
-    run_id = str(uuid.uuid4())
-    coll.update_one(
-        {"_id": doc["_id"]},
-        {"$set": {
-            "re_evaluation_requested": {
-                "request_id": run_id,
-                "requested_by": "api",
-                "requested_at": datetime.now(timezone.utc),
-                "force": bool(force)
-            },
-            "evaluation_status": "queued",
-            "evaluation_queued_at": datetime.now(timezone.utc),
-            "evaluated": False
-        }}
-    )
-    return {"status": "queued_for_evaluation", "job_id": run_id}
+def evaluate(assignment_id: str):
+    return re_evaluate(assignment_id)
 
 
 @app.post("/admin/scan-evaluate")
 def admin_manual_scan():
-    logger.info("api.admin_manual_scan: triggered by admin")
-    n = scan_and_process_once()
-    return {"processed": n}
+    return {"processed": scan_and_process_once()}
 
 
-def _extract_json_from_llm_raw(raw: str) -> dict:
+# ---------------------------------------------------------------------
+# LLM FIELD EXTRACTORS (PRODUCTION-SAFE)
+# ---------------------------------------------------------------------
+def _extract_total_score(raw: str) -> Optional[float]:
+    m = re.search(r'"total_score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
+    return float(m.group(1)) if m else None
+
+def _extract_scores(raw: str) -> Optional[Dict[str, float]]:
     """
-    Extract first valid JSON object from llm_raw
+    Extract rubric scores from LLM output.
+    Supports multiple schema versions:
+      - parameter_scores (new)
+      - score_breakdown (old)
     """
-    try:
-        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if not match:
-            return {}
-        return json.loads(match.group(0))
-    except Exception:
-        return {}
-
-
-def _format_feedback_markdown(feedback_obj: Any) -> Optional[str]:
-    """
-    Normalize and format AI-generated feedback into clean markdown.
-    Handles both pre-formatted markdown strings and dynamic dict structures.
-    """
-
-    # ✅ Case 1: Already markdown string
-    if isinstance(feedback_obj, str):
-        # Normalize 3+ newlines → 2 newlines
-        cleaned = re.sub(r"\n{3,}", "\n\n", feedback_obj)
-        return cleaned.strip()
-
-    # ❌ Not usable
-    if not isinstance(feedback_obj, dict):
+    if not raw:
         return None
 
+    # Prefer NEW key
+    for key in ("parameter_scores", "score_breakdown","grade_breakdown"):
+        m = re.search(
+            rf'"{key}"\s*:\s*\{{(.*?)\}}',
+            raw,
+            re.DOTALL
+        )
+        if not m:
+            continue
+
+        block = m.group(1)
+        scores: Dict[str, float] = {}
+
+        for name, val in re.findall(
+            r'"([^"]+)"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+            block
+        ):
+            scores[name] = float(val)
+
+        if scores:
+            return scores
+
+    return None
+
+
+
+def _extract_feedback(raw: str) -> Optional[str]:
+    m = re.search(r'"feedback"\s*:\s*\{(.*?)\}\s*,', raw, re.DOTALL)
+    if not m:
+        return None
+
+    block = m.group(1)
     parts: List[str] = []
 
-    for section, content in feedback_obj.items():
+    for section, text in re.findall(
+        r'"([^"]+)"\s*:\s*"([^"]*)"',
+        block
+    ):
         parts.append(f"### {section}")
+        parts.append(f"- {text}")
+        parts.append("")
 
-        if isinstance(content, list):
-            for item in content:
-                parts.append(f"- {item}")
+    return "\n".join(parts).strip() if parts else None
 
-        elif isinstance(content, dict):
-            for k, v in content.items():
-                parts.append(f"- **{k}:** {v}")
 
-        else:
-            parts.append(f"- {content}")
+def _extract_passed_status(raw: str) -> Optional[str]:
+    total = _extract_total_score(raw)
+    if total is None:
+        return None
 
-        parts.append("")  # single spacing between sections
+    m = re.search(r'"passing_score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
+    if not m:
+        return None
 
-    result = "\n".join(parts)
+    passing = float(m.group(1))
+    return "Pass" if total >= passing else "Fail"
 
-    # Final safety normalization
-    result = re.sub(r"\n{3,}", "\n\n", result)
 
-    return result.strip() if result else None
-
+# ---------------------------------------------------------------------
+# Result builder (UI CONTRACT)
+# ---------------------------------------------------------------------
 def _result_from_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build API result from stored document.
-    Handles old + new LLM formats and reformats feedback to markdown.
+    UI-facing result.
+    Schema-agnostic, production-safe.
     """
 
-    scores = None
-    overall = None
-    feedback_md = None
-    violations: List[Any] = []
+    llm_raw = doc.get("model_raw_response", {}).get("llm_raw") or ""
 
-    mrr = doc.get("model_raw_response")
-    if mrr:
-        llm_raw = mrr.get("llm_raw")
-        if llm_raw:
-            parsed = _extract_json_from_llm_raw(llm_raw)
-            logger.info(f"Parsed LLM raw: {parsed}")
-
-            # New LLM format
-            if "total_score" in parsed:
-                overall = parsed.get("total_score")
-                scores = parsed.get("grade_breakdown")
-                passed_status = parsed.get("passed")
-                feedback_md = _format_feedback_markdown(parsed.get("feedback"))
-                violations = parsed.get("priority_chunks") or []
-
-            # Old LLM format
-            else:
-                overall = parsed.get("overall")
-                scores = parsed.get("scores")
-                passed_status = parsed.get("passed")
-                feedback_md = _format_feedback_markdown(parsed.get("feedback"))
-                violations = parsed.get("violations") or []
+    scores = _extract_scores(llm_raw)
+    overall = _extract_total_score(llm_raw)
+    feedback = _extract_feedback(llm_raw)
+    passed_status = (
+        _extract_passed_status(llm_raw)
+        or doc.get("passed_status")
+    )
 
     return {
         "assignment_id": doc.get("assignment_id"),
@@ -210,12 +192,15 @@ def _result_from_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         "evaluation_status": doc.get("evaluation_status"),
         "scores": scores,
         "overall": overall,
-        "feedback": feedback_md,
-        "violations": violations,
+        "feedback": feedback,
+        "violations": [],
         "passed_status": passed_status,
     }
 
 
+# ---------------------------------------------------------------------
+# Results API
+# ---------------------------------------------------------------------
 @app.get("/assignments/{job_id}/{assignment_id}/results")
 def get_assignment_results(
     job_id: str,
@@ -224,32 +209,25 @@ def get_assignment_results(
 ):
     coll = db[config.get("mongo", {}).get("prompt_collection", "prompt_builder")]
 
-    base_query = {
+    query = {
         "evaluation_job_id": job_id,
-        "assignment_id": assignment_id
+        "assignment_id": assignment_id,
     }
+    if student_id:
+        query["student_id"] = student_id
+
+    docs = list(coll.find(query).sort("_id", -1))
 
     if student_id:
-        doc = coll.find_one(
-            {**base_query, "student_id": student_id},
-            sort=[("_id", -1)]
-        )
-        if not doc:
-            raise HTTPException(
-                status_code=404,
-                detail=f"assignment {assignment_id} for job {job_id} and student {student_id} not found"
-            )
-        return _result_from_doc(doc)
+        if not docs:
+            raise HTTPException(404, "result not found")
+        return _result_from_doc(docs[0])
 
-    cursor = coll.find(base_query)
-    results = [_result_from_doc(d) for d in cursor]
-
-    completed_count = sum(1 for r in results if r.get("evaluation_status") == "done")
-
+    results = [_result_from_doc(d) for d in docs]
     return {
         "job_id": job_id,
         "assignment_id": assignment_id,
         "count": len(results),
-        "completed": completed_count,
+        "completed": sum(1 for r in results if r["evaluation_status"] == "done"),
         "results": results,
     }

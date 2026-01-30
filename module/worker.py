@@ -451,7 +451,9 @@ def process_message(message: Dict[str, Any]):
 
     # dedupe check
     prompt_version = doc.get("prompt_version") or "v1"
-    source_text = (doc.get("system_prompt") or "") + (doc.get("user_prompt") or "") + (doc.get("submission") or "")
+    # Use extracted_excerpt (which contains student submission from file or description field)
+    submission_text = doc.get("extracted_excerpt") or doc.get("extractedExcerpt") or doc.get("submission") or ""
+    source_text = (doc.get("system_prompt") or "") + (doc.get("user_prompt") or "") + submission_text
     dedupe_key = _compute_dedupe_key(source_text, prompt_version)
     existing_dk = doc.get("dedupe_key")
     logger.debug("process_message: computed dedupe_key=%s existing=%s", dedupe_key[:12], (existing_dk or "")[:12])

@@ -144,7 +144,9 @@ def _fetch_candidates(limit: int) -> List[Dict[str, Any]]:
     q = _candidate_query()
     logger.debug("scanner._fetch_candidates: running query=%s limit=%d", q, limit)
     cursor = coll.find(q).sort([("evaluation_queued_at", 1), ("created_at", 1)]).limit(limit)
+    logger.info(f"records : {cursor}")
     docs = list(cursor)
+    logger.info("scanner._fetch_candidates: docs=%s", docs)
     logger.info("scanner._fetch_candidates: found %d candidate docs", len(docs))
     return docs
 
